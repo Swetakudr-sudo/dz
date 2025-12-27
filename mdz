@@ -1,0 +1,955 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <string>
+#include <algorithm>
+#include <limits>
+#include <cstdlib>
+#include <cstdio>
+
+// Константы для варианта 5
+const double MASS = 70000.0;
+const double WING_AREA = 113.0;
+const double NOMINAL_THRUST = 2 * 137200.0;
+const double THRUST_PERCENT = 1.0;
+const double INIT_ALTITUDE = 300.0;
+const double FINAL_ALTITUDE = 6000.0;
+const double INIT_VELOCITY_KMH = 300.0;
+const double FINAL_VELOCITY_KMH = 500.0;
+const double GRAVITY = 9.81;
+const double PI = 3.141592653589793;
+const double DEG_TO_RAD = PI / 180.0;
+const double MAX_CLIMB_ANGLE = 15.0;
+const double MAX_VERTICAL_SPEED = 8.0;
+const double MIN_CLIMB_SPEED_KMH = 320.0;
+const int GRID_SIZE = 22;
+
+// Критерии оптимизации
+enum OptimizationCriterion {
+    MIN_TIME = 1,
+    MIN_FUEL = 2
+};
+
+// Типы манёвров
+enum ManeuverType {
+    ACCELERATION = 1,
+    CLIMB = 2,
+    COMBINED = 3
+};
+
+// Структура для атмосферных данных
+struct AtmospherePoint {
+    double altitude;
+    double density;
+    double sound_speed;
+    double temperature;
+    double pressure;
+};
+
+// Данные атмосферы ISA
+static const AtmospherePoint ATMOSPHERE_TABLE[] = {
+    {0.0,     1.22500, 340.294, 288.150, 1.01325e5},
+    {500.0,   1.16727, 338.370, 284.900, 9.54613e4},
+    {1000.0,  1.11166, 336.435, 281.651, 8.98763e4},
+    {2000.0,  1.00655, 332.532, 275.154, 7.95014e4},
+    {3000.0,  0.90925, 328.584, 268.659, 7.01212e4},
+    {4000.0,  0.81935, 324.589, 262.166, 6.16604e4},
+    {5000.0,  0.73643, 320.545, 255.676, 5.40483e4},
+    {6000.0,  0.66011, 316.452, 249.187, 4.72176e4},
+    {7000.0,  0.59002, 312.306, 242.700, 4.11051e4},
+    {8000.0,  0.52678, 308.105, 236.215, 3.56516e4},
+    {9000.0,  0.46706, 303.848, 229.733, 3.08007e4},
+    {10000.0, 0.41351, 299.532, 223.252, 2.64999e4}
+};
+const int ATMOSPHERE_POINTS = 12;
+
+// Класс для работы с атмосферой
+class Atmosphere {
+public:
+    static double interpolate(double x, double x0, double x1, double y0, double y1) {
+        if (std::abs(x1 - x0) < 1e-9) return y0;
+        return y0 + (x - x0) * (y1 - y0) / (x1 - x0);
+    }
+
+    static void getAtmosphere(double altitude, double& density, double& sound_speed) {
+        if (altitude <= ATMOSPHERE_TABLE[0].altitude) {
+            density = ATMOSPHERE_TABLE[0].density;
+            sound_speed = ATMOSPHERE_TABLE[0].sound_speed;
+            return;
+        }
+        
+        if (altitude >= ATMOSPHERE_TABLE[ATMOSPHERE_POINTS - 1].altitude) {
+            density = ATMOSPHERE_TABLE[ATMOSPHERE_POINTS - 1].density;
+            sound_speed = ATMOSPHERE_TABLE[ATMOSPHERE_POINTS - 1].sound_speed;
+            return;
+        }
+        
+        for (int i = 0; i < ATMOSPHERE_POINTS - 1; ++i) {
+            if (altitude >= ATMOSPHERE_TABLE[i].altitude && 
+                altitude < ATMOSPHERE_TABLE[i + 1].altitude) {
+                density = interpolate(altitude,
+                    ATMOSPHERE_TABLE[i].altitude,
+                    ATMOSPHERE_TABLE[i + 1].altitude,
+                    ATMOSPHERE_TABLE[i].density,
+                    ATMOSPHERE_TABLE[i + 1].density);
+                
+                sound_speed = interpolate(altitude,
+                    ATMOSPHERE_TABLE[i].altitude,
+                    ATMOSPHERE_TABLE[i + 1].altitude,
+                    ATMOSPHERE_TABLE[i].sound_speed,
+                    ATMOSPHERE_TABLE[i + 1].sound_speed);
+                return;
+            }
+        }
+    }
+
+    static double getPressure(double altitude) {
+        if (altitude <= ATMOSPHERE_TABLE[0].altitude) return ATMOSPHERE_TABLE[0].pressure;
+        if (altitude >= ATMOSPHERE_TABLE[ATMOSPHERE_POINTS - 1].altitude) 
+            return ATMOSPHERE_TABLE[ATMOSPHERE_POINTS - 1].pressure;
+        
+        for (int i = 0; i < ATMOSPHERE_POINTS - 1; ++i) {
+            if (altitude >= ATMOSPHERE_TABLE[i].altitude && 
+                altitude < ATMOSPHERE_TABLE[i + 1].altitude) {
+                return interpolate(altitude,
+                    ATMOSPHERE_TABLE[i].altitude,
+                    ATMOSPHERE_TABLE[i + 1].altitude,
+                    ATMOSPHERE_TABLE[i].pressure,
+                    ATMOSPHERE_TABLE[i + 1].pressure);
+            }
+        }
+        return ATMOSPHERE_TABLE[0].pressure;
+    }
+};
+
+// Класс для записи CSV
+class CSVWriter {
+private:
+    std::ofstream file;
+
+public:
+    CSVWriter(const std::string& filename) {
+        file.open(filename);
+        if (!file.is_open()) {
+            throw std::runtime_error("Cannot open file: " + filename);
+        }
+    }
+
+    ~CSVWriter() {
+        if (file.is_open()) file.close();
+    }
+
+    void writeHeader(const std::vector<std::string>& headers) {
+        for (size_t i = 0; i < headers.size(); ++i) {
+            file << headers[i];
+            if (i < headers.size() - 1) file << ",";
+        }
+        file << "\n";
+    }
+
+    void writeRow(const std::vector<double>& row) {
+        for (size_t i = 0; i < row.size(); ++i) {
+            file << std::setprecision(6) << row[i];
+            if (i < row.size() - 1) file << ",";
+        }
+        file << "\n";
+    }
+};
+
+// Структура точки траектории
+struct TrajectoryPoint {
+    double time;
+    double altitude;
+    double velocity_ms;
+    double velocity_kmh;
+    ManeuverType maneuver;
+    double segment_time;
+    double segment_fuel;
+    
+    TrajectoryPoint(double t = 0, double h = 0, double v_ms = 0, 
+                   ManeuverType m = ACCELERATION, double st = 0, double sf = 0)
+        : time(t), altitude(h), velocity_ms(v_ms), velocity_kmh(v_ms * 3.6),
+          maneuver(m), segment_time(st), segment_fuel(sf) {}
+};
+
+// Структура результата траектории
+struct TrajectoryResult {
+    std::vector<TrajectoryPoint> points;
+    double total_time;
+    double total_fuel;
+    double avg_climb_rate;
+    int acceleration_count;
+    int climb_count;
+    int combined_count;
+    std::string name;
+};
+
+// Класс самолёта
+class Aircraft {
+private:
+    const double CY0 = 0.25;
+    const double CY1 = 0.078;
+    const double CX0 = 0.021;
+    const double K = 0.032;
+
+public:
+    double mass;
+    double wing_area;
+    
+    Aircraft(double m = MASS, double S = WING_AREA) : mass(m), wing_area(S) {}
+    
+    // Расчёт угла атаки
+    double calculateAngleOfAttack(double altitude, double velocity_ms) const {
+        double density, sound_speed;
+        Atmosphere::getAtmosphere(altitude, density, sound_speed);
+        
+        double thrust = calculateThrust(altitude, velocity_ms);
+        double q = 0.5 * density * velocity_ms * velocity_ms;
+        
+        if (q < 100.0) return 8.0;
+        
+        double alpha = (mass * GRAVITY - thrust / (180.0 / PI) - 
+                       CY0 * q * wing_area) / (CY1 * q * wing_area);
+        
+        return std::max(0.0, std::min(10.0, alpha));
+    }
+    
+    // Расчёт коэффициента подъёмной силы
+    double calculateLiftCoefficient(double alpha_deg) const {
+        double Cy = CY0 + CY1 * alpha_deg;
+        return std::min(Cy, 1.1);
+    }
+    
+    // Расчёт коэффициента сопротивления
+    double calculateDragCoefficient(double Cy) const {
+        return CX0 + K * Cy * Cy;
+    }
+    
+    // Расчёт тяги
+    double calculateThrust(double altitude, double velocity_ms) const {
+        double density, sound_speed;
+        Atmosphere::getAtmosphere(altitude, density, sound_speed);
+        
+        double Mach = velocity_ms / sound_speed;
+        double H_km = altitude / 1000.0;
+        
+        double P_sea = 137200.0;
+        double altitude_factor = 1.0 - 0.48 * pow(H_km / 11.0, 0.72);
+        double mach_factor = 0.9 + 0.22 * Mach;
+        if (mach_factor > 1.06) mach_factor = 1.06;
+        
+        return 2.0 * P_sea * altitude_factor * mach_factor * THRUST_PERCENT;
+    }
+    
+    // Расчёт расхода топлива
+    double calculateFuelConsumption(double altitude, double velocity_ms, double thrust_setting) const {
+        double density, sound_speed;
+        Atmosphere::getAtmosphere(altitude, density, sound_speed);
+        
+        double Mach = velocity_ms / sound_speed;
+        double H_km = altitude / 1000.0;
+        
+        double Cp_base = 0.58;
+        double regime_factor;
+        
+        if (thrust_setting >= 1.0) {
+            regime_factor = 1.0 + 0.42 * pow(thrust_setting - 1.0, 1.1);
+        } else if (thrust_setting >= 0.88) {
+            regime_factor = 0.9 - 0.02 * (thrust_setting - 0.88) / 0.12;
+        } else if (thrust_setting >= 0.70) {
+            regime_factor = 0.9 + 0.1 * pow((0.88 - thrust_setting) / 0.18, 1.05);
+        } else {
+            regime_factor = 1.12;
+        }
+        
+        double altitude_factor = 1.0 - 0.08 * std::min(1.0, H_km / 11.0);
+        double mach_factor = 1.0 + 0.12 * std::max(0.0, Mach - 0.5);
+        
+        return Cp_base * regime_factor * altitude_factor * mach_factor / GRAVITY;
+    }
+};
+
+// Структура данных сегмента
+struct SegmentData {
+    double time;
+    double fuel;
+    bool valid;
+    
+    SegmentData() : time(0), fuel(0), valid(false) {}
+    SegmentData(double t, double f, bool v) : time(t), fuel(f), valid(v) {}
+};
+
+// Класс для расчёта манёвров
+class ManeuverCalculator {
+private:
+    Aircraft aircraft;
+    
+public:
+    ManeuverCalculator(const Aircraft& ac) : aircraft(ac) {}
+    
+    // Расчёт ускорения на постоянной высоте
+    SegmentData calculateAcceleration(double altitude, double V1_ms, double V2_ms, double thrust_setting) {
+        if (V2_ms <= V1_ms) return SegmentData(0, 0, false);
+        
+        double V_avg = 0.5 * (V1_ms + V2_ms);
+        double alpha = aircraft.calculateAngleOfAttack(altitude, V_avg);
+        
+        double thrust = aircraft.calculateThrust(altitude, V_avg) * thrust_setting;
+        double Cy = aircraft.calculateLiftCoefficient(alpha);
+        double Cx = aircraft.calculateDragCoefficient(Cy);
+        
+        double density, sound_speed;
+        Atmosphere::getAtmosphere(altitude, density, sound_speed);
+        
+        double q = 0.5 * density * V_avg * V_avg;
+        double drag = Cx * q * aircraft.wing_area;
+        
+        double acceleration = (thrust * cos(alpha * DEG_TO_RAD) - drag) / aircraft.mass;
+        
+        if (acceleration <= 0.01) return SegmentData(0, 0, false);
+        
+        double dt = (V2_ms - V1_ms) / acceleration;
+        if (dt <= 0 || dt > 1000.0) return SegmentData(0, 0, false);
+        
+        double cp = aircraft.calculateFuelConsumption(altitude, V_avg, thrust_setting);
+        double fuel = cp * thrust * dt / 3600.0;
+        
+        return SegmentData(dt, fuel, true);
+    }
+    
+    // Расчёт набора высоты на постоянной скорости
+    SegmentData calculateClimb(double H1, double H2, double V_ms, double thrust_setting) {
+        if (V_ms * 3.6 < MIN_CLIMB_SPEED_KMH) return SegmentData(0, 0, false);
+        
+        double H_avg = 0.5 * (H1 + H2);
+        double alpha = aircraft.calculateAngleOfAttack(H_avg, V_ms);
+        
+        double thrust = aircraft.calculateThrust(H_avg, V_ms) * thrust_setting;
+        double Cy = aircraft.calculateLiftCoefficient(alpha);
+        double Cx = aircraft.calculateDragCoefficient(Cy);
+        
+        double density, sound_speed;
+        Atmosphere::getAtmosphere(H_avg, density, sound_speed);
+        
+        double q = 0.5 * density * V_ms * V_ms;
+        double drag = Cx * q * aircraft.wing_area;
+        
+        double excess_thrust = thrust - drag;
+        if (excess_thrust <= 0) return SegmentData(0, 0, false);
+        
+        double sin_theta = std::min(excess_thrust / (aircraft.mass * GRAVITY), 
+                                  sin(MAX_CLIMB_ANGLE * DEG_TO_RAD));
+        if (sin_theta <= 0.005) return SegmentData(0, 0, false);
+        
+        double Vy = V_ms * sin_theta;
+        if (Vy > MAX_VERTICAL_SPEED) Vy = MAX_VERTICAL_SPEED;
+        
+        double dt = (H2 - H1) / Vy;
+        if (dt <= 0 || dt > 2000.0) return SegmentData(0, 0, false);
+        
+        double cp = aircraft.calculateFuelConsumption(H_avg, V_ms, thrust_setting);
+        double fuel = cp * thrust * dt / 3600.0;
+        
+        return SegmentData(dt, fuel, true);
+    }
+    
+    // Расчёт комбинированного манёвра
+    SegmentData calculateCombined(double H1, double H2, double V1_ms, double V2_ms, double thrust_setting) {
+        double V_avg = 0.5 * (V1_ms + V2_ms);
+        double H_avg = 0.5 * (H1 + H2);
+        
+        if (V_avg * 3.6 < (MIN_CLIMB_SPEED_KMH * 0.95)) 
+            return SegmentData(0, 0, false);
+        
+        SegmentData accel = calculateAcceleration(H_avg, V1_ms, V2_ms, thrust_setting);
+        SegmentData climb = calculateClimb(H1, H2, V_avg, thrust_setting);
+        
+        if (!accel.valid || !climb.valid) return SegmentData(0, 0, false);
+        
+        double dH = H2 - H1;
+        double dV_kmh = (V2_ms - V1_ms) * 3.6;
+        
+        double time_climb = dH / 5.0;
+        double time_accel = std::abs(dV_kmh) / 15.0;
+        
+        double dt = std::max(time_climb, time_accel);
+        if (dt <= 0 || dt > 3000.0) return SegmentData(0, 0, false);
+        
+        double Vy = dH / dt;
+        if (Vy < 0.3 || Vy > MAX_VERTICAL_SPEED * 1.2) 
+            return SegmentData(0, 0, false);
+        
+        double thrust = aircraft.calculateThrust(H_avg, V_avg) * thrust_setting;
+        double cp = aircraft.calculateFuelConsumption(H_avg, V_avg, thrust_setting);
+        double fuel = cp * thrust * dt / 3600.0;
+        
+        return SegmentData(dt, fuel, true);
+    }
+};
+
+// Класс оптимизатора
+class TrajectoryOptimizer {
+private:
+    Aircraft aircraft;
+    ManeuverCalculator calculator;
+    int grid_size;
+    
+public:
+    TrajectoryOptimizer(int N = GRID_SIZE) : aircraft(), calculator(aircraft), grid_size(N) {}
+    
+    TrajectoryResult optimize(OptimizationCriterion criterion, const std::string& name) {
+        std::cout << "\n========================================\n";
+        if (criterion == MIN_TIME) {
+            std::cout << "КРИТЕРИЙ: МИНИМИЗАЦИЯ ВРЕМЕНИ (" << name << ")\n";
+        } else {
+            std::cout << "КРИТЕРИЙ: МИНИМИЗАЦИЯ ТОПЛИВА (" << name << ")\n";
+        }
+        std::cout << "========================================\n\n";
+        
+        std::vector<double> altitude_grid(grid_size + 1);
+        std::vector<double> velocity_grid_ms(grid_size + 1);
+        std::vector<double> velocity_grid_kmh(grid_size + 1);
+        
+        double dH = (FINAL_ALTITUDE - INIT_ALTITUDE) / grid_size;
+        double dV_kmh = (FINAL_VELOCITY_KMH - INIT_VELOCITY_KMH) / grid_size;
+        
+        for (int i = 0; i <= grid_size; ++i) {
+            altitude_grid[i] = INIT_ALTITUDE + i * dH;
+            velocity_grid_kmh[i] = INIT_VELOCITY_KMH + i * dV_kmh;
+            velocity_grid_ms[i] = velocity_grid_kmh[i] / 3.6;
+        }
+        
+        std::cout << "Количество шагов: " << grid_size << "\n";
+        std::cout << "Шаг по высоте: " << dH << " м\n";
+        std::cout << "Шаг по скорости: " << dV_kmh << " км/ч\n\n";
+        
+        std::vector<double> thrust_settings;
+        double max_vy_factor;
+        
+        if (criterion == MIN_TIME) {
+            thrust_settings = {1.08, 1.05, 1.00};
+            max_vy_factor = 1.0;
+        } else {
+            thrust_settings = {0.88, 0.82, 0.75};
+            max_vy_factor = 0.65;
+        }
+        
+        std::vector<std::vector<double>> cost(grid_size + 1, 
+            std::vector<double>(grid_size + 1, 1e9));
+        std::vector<std::vector<double>> time(grid_size + 1, 
+            std::vector<double>(grid_size + 1, 0.0));
+        std::vector<std::vector<double>> fuel(grid_size + 1, 
+            std::vector<double>(grid_size + 1, 0.0));
+        std::vector<std::vector<int>> prev_i(grid_size + 1, 
+            std::vector<int>(grid_size + 1, -1));
+        std::vector<std::vector<int>> prev_j(grid_size + 1, 
+            std::vector<int>(grid_size + 1, -1));
+        std::vector<std::vector<ManeuverType>> maneuver(grid_size + 1, 
+            std::vector<ManeuverType>(grid_size + 1, ACCELERATION));
+        
+        cost[0][0] = 0.0;
+        
+        for (int i = 0; i <= grid_size; ++i) {
+            for (int j = 0; j <= grid_size; ++j) {
+                if (cost[i][j] >= 1e9) continue;
+                
+                double H = altitude_grid[i];
+                double V = velocity_grid_ms[j];
+                
+                for (double setting : thrust_settings) {
+                    if (j < grid_size) {
+                        double V2 = velocity_grid_ms[j + 1];
+                        SegmentData seg = calculator.calculateAcceleration(H, V, V2, setting);
+                        
+                        if (seg.valid) {
+                            double increment = (criterion == MIN_TIME) ? seg.time : seg.fuel;
+                            double new_cost = cost[i][j] + increment;
+                            
+                            if (new_cost < cost[i][j + 1]) {
+                                cost[i][j + 1] = new_cost;
+                                time[i][j + 1] = time[i][j] + seg.time;
+                                fuel[i][j + 1] = fuel[i][j] + seg.fuel;
+                                prev_i[i][j + 1] = i;
+                                prev_j[i][j + 1] = j;
+                                maneuver[i][j + 1] = ACCELERATION;
+                            }
+                        }
+                    }
+                    
+                    if (i < grid_size) {
+                        double H2 = altitude_grid[i + 1];
+                        SegmentData seg = calculator.calculateClimb(H, H2, V, setting);
+                        
+                        if (seg.valid) {
+                            double increment = (criterion == MIN_TIME) ? seg.time : seg.fuel;
+                            double new_cost = cost[i][j] + increment;
+                            
+                            if (new_cost < cost[i + 1][j]) {
+                                cost[i + 1][j] = new_cost;
+                                time[i + 1][j] = time[i][j] + seg.time;
+                                fuel[i + 1][j] = fuel[i][j] + seg.fuel;
+                                prev_i[i + 1][j] = i;
+                                prev_j[i + 1][j] = j;
+                                maneuver[i + 1][j] = CLIMB;
+                            }
+                        }
+                    }
+                    
+                    if (i < grid_size && j < grid_size) {
+                        double H2 = altitude_grid[i + 1];
+                        double V2 = velocity_grid_ms[j + 1];
+                        SegmentData seg = calculator.calculateCombined(H, H2, V, V2, setting);
+                        
+                        if (seg.valid) {
+                            double increment = (criterion == MIN_TIME) ? seg.time : seg.fuel;
+                            double new_cost = cost[i][j] + increment;
+                            
+                            if (new_cost < cost[i + 1][j + 1]) {
+                                cost[i + 1][j + 1] = new_cost;
+                                time[i + 1][j + 1] = time[i][j] + seg.time;
+                                fuel[i + 1][j + 1] = fuel[i][j] + seg.fuel;
+                                prev_i[i + 1][j + 1] = i;
+                                prev_j[i + 1][j + 1] = j;
+                                maneuver[i + 1][j + 1] = COMBINED;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Сохраняем матрицы времени и топлива
+        std::string suffix = (criterion == MIN_TIME) ? "min_time" : "min_fuel";
+        
+        // Сохраняем матрицу времени в CSV
+        std::ofstream time_csv("time_matrix_" + suffix + ".csv");
+        time_csv << "H/V";
+        for (int j = 0; j <= grid_size; j++) {
+            time_csv << "," << velocity_grid_kmh[j];
+        }
+        time_csv << "\n";
+        
+        for (int i = 0; i <= grid_size; i++) {
+            time_csv << altitude_grid[i];
+            for (int j = 0; j <= grid_size; j++) {
+                time_csv << ",";
+                if (time[i][j] < 1e8) {
+                    time_csv << time[i][j];
+                }
+            }
+            time_csv << "\n";
+        }
+        time_csv.close();
+        
+        // Сохраняем матрицу топлива в CSV
+        std::ofstream fuel_csv("fuel_matrix_" + suffix + ".csv");
+        fuel_csv << "H/V";
+        for (int j = 0; j <= grid_size; j++) {
+            fuel_csv << "," << velocity_grid_kmh[j];
+        }
+        fuel_csv << "\n";
+        
+        for (int i = 0; i <= grid_size; i++) {
+            fuel_csv << altitude_grid[i];
+            for (int j = 0; j <= grid_size; j++) {
+                fuel_csv << ",";
+                if (fuel[i][j] < 1e8) {
+                    fuel_csv << fuel[i][j];
+                }
+            }
+            fuel_csv << "\n";
+        }
+        fuel_csv.close();
+        
+        // ВЫВОД ТАБЛИЦЫ МАТРИЦЫ ВРЕМЕНИ
+        std::cout << "\n═══════════════════════════════════════════════════════════════════════════════\n";
+        std::cout << "МАТРИЦА ВРЕМЕНИ ПОЛЁТА (секунды):\n";
+        std::cout << "═══════════════════════════════════════════════════════════════════════════════\n";
+        
+        // Заголовок таблицы (скорости)
+        std::cout << "        V(км/ч) → ";
+        for (int j = 0; j <= grid_size; ++j) {
+            std::cout << std::setw(8) << static_cast<int>(velocity_grid_kmh[j]) << " ";
+        }
+        std::cout << "\n" << std::string(105, '-') << "\n";
+        
+        // Данные таблицы
+        for (int i = 0; i <= grid_size; ++i) {
+            std::cout << "H(м) ";
+            std::cout << std::setw(6) << static_cast<int>(altitude_grid[i]) << " │ ";
+            for (int j = 0; j <= grid_size; ++j) {
+                if (time[i][j] < 1e8 && time[i][j] > 0) {
+                    std::cout << std::setw(7) << static_cast<int>(time[i][j]) << " ";
+                } else if (time[i][j] == 0 && i == 0 && j == 0) {
+                    std::cout << std::setw(7) << "0" << " ";
+                } else {
+                    std::cout << std::setw(7) << "---" << " ";
+                }
+            }
+            std::cout << "\n";
+        }
+        
+        // ВЫВОД ТАБЛИЦЫ МАТРИЦЫ ТОПЛИВА
+        std::cout << "\n═══════════════════════════════════════════════════════════════════════════════\n";
+        std::cout << "МАТРИЦА РАСХОДА ТОПЛИВА (кг):\n";
+        std::cout << "═══════════════════════════════════════════════════════════════════════════════\n";
+        
+        // Заголовок таблицы (скорости)
+        std::cout << "        V(км/ч) → ";
+        for (int j = 0; j <= grid_size; ++j) {
+            std::cout << std::setw(8) << static_cast<int>(velocity_grid_kmh[j]) << " ";
+        }
+        std::cout << "\n" << std::string(105, '-') << "\n";
+        
+        // Данные таблицы
+        for (int i = 0; i <= grid_size; ++i) {
+            std::cout << "H(м) ";
+            std::cout << std::setw(6) << static_cast<int>(altitude_grid[i]) << " │ ";
+            for (int j = 0; j <= grid_size; ++j) {
+                if (fuel[i][j] < 1e8 && fuel[i][j] > 0) {
+                    std::cout << std::setw(7) << std::fixed << std::setprecision(1) << fuel[i][j] << " ";
+                } else if (fuel[i][j] == 0 && i == 0 && j == 0) {
+                    std::cout << std::setw(7) << "0" << " ";
+                } else {
+                    std::cout << std::setw(7) << "---" << " ";
+                }
+            }
+            std::cout << "\n";
+        }
+        
+        if (cost[grid_size][grid_size] >= 1e9) {
+            throw std::runtime_error("Optimal path not found!");
+        }
+        
+        // Восстановление пути
+        std::vector<std::pair<int, int>> path_indices;
+        int ci = grid_size, cj = grid_size;
+        
+        while (ci >= 0 && cj >= 0) {
+            path_indices.push_back(std::make_pair(ci, cj));
+            int pi = prev_i[ci][cj];
+            int pj = prev_j[ci][cj];
+            if (pi == -1) break;
+            ci = pi;
+            cj = pj;
+        }
+        
+        std::reverse(path_indices.begin(), path_indices.end());
+        
+        // Создание траектории
+        std::vector<TrajectoryPoint> trajectory;
+        double current_time = 0.0;
+        double current_fuel = 0.0;
+        
+        for (size_t idx = 0; idx < path_indices.size(); ++idx) {
+            int i = path_indices[idx].first;
+            int j = path_indices[idx].second;
+            
+            double alt = altitude_grid[i];
+            double vel_ms = velocity_grid_ms[j];
+            ManeuverType man = (idx == 0) ? ACCELERATION : maneuver[i][j];
+            
+            double seg_time = 0;
+            double seg_fuel = 0;
+            
+            if (idx > 0) {
+                int pi = path_indices[idx - 1].first;
+                int pj = path_indices[idx - 1].second;
+                
+                seg_time = time[i][j] - time[pi][pj];
+                seg_fuel = fuel[i][j] - fuel[pi][pj];
+                current_time += seg_time;
+                current_fuel += seg_fuel;
+            }
+            
+            trajectory.push_back(TrajectoryPoint(current_time, alt, vel_ms, man, seg_time, seg_fuel));
+        }
+        
+        // Подсчёт статистики
+        int acc_count = 0, climb_count = 0, comb_count = 0;
+        for (size_t i = 1; i < trajectory.size(); ++i) {
+            switch(trajectory[i].maneuver) {
+                case ACCELERATION: acc_count++; break;
+                case CLIMB: climb_count++; break;
+                case COMBINED: comb_count++; break;
+            }
+        }
+        
+        TrajectoryResult result;
+        result.points = trajectory;
+        result.total_time = trajectory.back().time;
+        result.total_fuel = current_fuel;
+        result.avg_climb_rate = (FINAL_ALTITUDE - INIT_ALTITUDE) / result.total_time;
+        result.acceleration_count = acc_count;
+        result.climb_count = climb_count;
+        result.combined_count = comb_count;
+        result.name = name;
+        
+        // Сохранение траектории в CSV
+        std::ofstream traj_csv("trajectory_" + suffix + ".csv");
+        traj_csv << "Point,H_m,V_kmh,Maneuver,Segment_time_s,Segment_fuel_kg\n";
+        
+        for (size_t k = 0; k < trajectory.size(); k++) {
+            traj_csv << k + 1 << ","
+                << trajectory[k].altitude << ","
+                << trajectory[k].velocity_kmh << ",";
+            
+            if (k == 0) {
+                traj_csv << "START,0,0";
+            } else {
+                std::string maneuver_str;
+                if (trajectory[k].maneuver == ACCELERATION) maneuver_str = "RAZGON";
+                else if (trajectory[k].maneuver == CLIMB) maneuver_str = "PODIEM";
+                else if (trajectory[k].maneuver == COMBINED) maneuver_str = "RAZGON_PODIEM";
+                
+                traj_csv << maneuver_str << ","
+                    << trajectory[k].segment_time << ","
+                    << trajectory[k].segment_fuel;
+            }
+            traj_csv << "\n";
+        }
+        traj_csv.close();
+        
+        // ВЫВОД ТАБЛИЦЫ ТРАЕКТОРИИ
+        std::cout << "\n═══════════════════════════════════════════════════════════════════════════════\n";
+        std::cout << "ОПТИМАЛЬНАЯ ТРАЕКТОРИЯ:\n";
+        std::cout << "═══════════════════════════════════════════════════════════════════════════════\n";
+        std::cout << " Шаг │  Время (с) │ Высота (м) │ Скорость (км/ч) │  Манёвр  │ t сегм.(с) │ F сегм.(кг)\n";
+        std::cout << std::string(105, '-') << "\n";
+        
+        for (size_t k = 0; k < trajectory.size(); k++) {
+            std::cout << std::setw(4) << k+1 << " │ "
+                      << std::setw(10) << std::fixed << std::setprecision(1) << trajectory[k].time << " │ "
+                      << std::setw(10) << trajectory[k].altitude << " │ "
+                      << std::setw(15) << std::fixed << std::setprecision(1) << trajectory[k].velocity_kmh << " │ ";
+            
+            if (k == 0) {
+                std::cout << std::setw(9) << "СТАРТ" << " │ ";
+            } else {
+                std::string maneuver_str;
+                if (trajectory[k].maneuver == ACCELERATION) maneuver_str = "РАЗГОН";
+                else if (trajectory[k].maneuver == CLIMB) maneuver_str = "ПОДЪЁМ";
+                else if (trajectory[k].maneuver == COMBINED) maneuver_str = "РАЗ+ПОД";
+                std::cout << std::setw(9) << maneuver_str << " │ ";
+            }
+            
+            if (k == 0) {
+                std::cout << std::setw(11) << "0.0" << " │ "
+                          << std::setw(12) << "0.0" << "\n";
+            } else {
+                std::cout << std::setw(11) << std::fixed << std::setprecision(1) << trajectory[k].segment_time << " │ "
+                          << std::setw(12) << std::fixed << std::setprecision(2) << trajectory[k].segment_fuel << "\n";
+            }
+        }
+        
+        std::cout << std::string(105, '-') << "\n";
+        std::cout << " ИТОГО            │ "
+                  << std::setw(10) << std::fixed << std::setprecision(1) << result.total_time << " │            │                 │          │ "
+                  << std::setw(11) << std::fixed << std::setprecision(1) << result.total_time << " │ "
+                  << std::setw(12) << std::fixed << std::setprecision(2) << result.total_fuel << "\n";
+        std::cout << std::string(105, '═') << "\n";
+        
+        // Вывод итоговых результатов
+        std::cout << "\n=============================================\n";
+        std::cout << "Использовано в траектории:\n";
+        std::cout << "- Разгон: " << acc_count << " раз\n";
+        std::cout << "- Подъем: " << climb_count << " раз\n";
+        std::cout << "- Разгон+Подъем: " << comb_count << " раз\n";
+        std::cout << "---------------------------------------------\n";
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "Время манёвра:     " << result.total_time << " с  ("
+                  << result.total_time / 60.0 << " мин)\n";
+        std::cout << "Расход топлива:    " << result.total_fuel << " кг\n";
+        std::cout << "Средняя Vy:        " << result.avg_climb_rate << " м/с  ("
+                  << result.avg_climb_rate * 60.0 << " м/мин)\n";
+        std::cout << "\nФайлы созданы:\n";
+        std::cout << "- trajectory_" << suffix << ".csv\n";
+        std::cout << "- time_matrix_" << suffix << ".csv\n";
+        std::cout << "- fuel_matrix_" << suffix << ".csv\n";
+        std::cout << "=============================================\n";
+        
+        return result;
+    }
+};
+
+// Функция для создания GNUPLOT скриптов
+void createGnuplotScripts(const TrajectoryResult& time_result, const TrajectoryResult& fuel_result) {
+    std::cout << "\nCreating GNUPLOT scripts...\n";
+    
+    // Скрипт для сравнения
+    std::ofstream comp_script("plot_comparison.gp");
+    comp_script << "# GNUPLOT script for trajectory comparison\n";
+    comp_script << "set terminal pngcairo size 1200,800 enhanced font 'Verdana,12'\n";
+    comp_script << "set output 'MS-21_comparison.png'\n\n";
+    comp_script << "set title 'MS-21 Trajectory Comparison'\n";
+    comp_script << "set xlabel 'Speed V (km/h)'\n";
+    comp_script << "set ylabel 'Altitude H (m)'\n";
+    comp_script << "set grid\n";
+    comp_script << "set key top left\n";
+    comp_script << "set datafile separator ','\n\n";
+    comp_script << "plot 'trajectory_min_time.csv' using 3:2 every ::1 \\\n";
+    comp_script << "     with linespoints lw 2 pt 7 ps 1.2 lc rgb 'red' \\\n";
+    comp_script << "     title 'Min Time (" << time_result.total_time / 60.0
+                << " min, " << time_result.total_fuel << " kg)', \\\n";
+    comp_script << "     'trajectory_min_fuel.csv' using 3:2 every ::1 \\\n";
+    comp_script << "     with linespoints lw 2 pt 7 ps 1.2 lc rgb 'blue' \\\n";
+    comp_script << "     title 'Min Fuel (" << fuel_result.total_time / 60.0
+                << " min, " << fuel_result.total_fuel << " kg)'\n";
+    comp_script.close();
+    
+    // BAT файл для Windows
+    std::ofstream bat_file("run_plots.bat");
+    bat_file << "@echo off\n";
+    bat_file << "echo Running GNUPLOT scripts for MS-21...\n";
+    bat_file << "echo.\n";
+    bat_file << "echo 1. Comparison plot\n";
+    bat_file << "gnuplot plot_comparison.gp\n";
+    bat_file << "echo.\n";
+    bat_file << "echo Plots created:\n";
+    bat_file << "echo - MS-21_comparison.png\n";
+    bat_file << "echo.\n";
+    bat_file << "pause\n";
+    bat_file.close();
+}
+
+// Функция для вывода сравнения двух траекторий
+void printComparisonTable(const TrajectoryResult& time_result, const TrajectoryResult& fuel_result) {
+    std::cout << "\n═══════════════════════════════════════════════════════════════════════════════\n";
+    std::cout << "СРАВНИТЕЛЬНАЯ ТАБЛИЦА РЕЗУЛЬТАТОВ:\n";
+    std::cout << "═══════════════════════════════════════════════════════════════════════════════\n";
+    std::cout << " Параметр                │ Минимизация времени          │ Минимизация топлива    \n";
+    std::cout << std::string(85, '─') << "\n";
+    
+    std::cout << " Общее время (мин)      │ " 
+              << std::setw(25) << std::fixed << std::setprecision(2) << time_result.total_time/60.0 << " │ "
+              << std::setw(25) << fuel_result.total_time/60.0 << "\n";
+    
+    std::cout << " Общее время (сек)      │ " 
+              << std::setw(25) << std::fixed << std::setprecision(1) << time_result.total_time << " │ "
+              << std::setw(25) << fuel_result.total_time << "\n";
+    
+    std::cout << " Расход топлива (кг)    │ " 
+              << std::setw(25) << std::fixed << std::setprecision(2) << time_result.total_fuel << " │ "
+              << std::setw(25) << fuel_result.total_fuel << "\n";
+    
+    std::cout << " Средняя Vy (м/с)       │ " 
+              << std::setw(25) << std::fixed << std::setprecision(3) << time_result.avg_climb_rate << " │ "
+              << std::setw(25) << fuel_result.avg_climb_rate << "\n";
+    
+    std::cout << " Количество сегментов   │ " 
+              << std::setw(25) << time_result.points.size()-1 << " │ "
+              << std::setw(25) << fuel_result.points.size()-1 << "\n";
+    
+    std::cout << " - Разгон               │ " 
+              << std::setw(25) << time_result.acceleration_count << " │ "
+              << std::setw(25) << fuel_result.acceleration_count << "\n";
+    
+    std::cout << " - Подъём               │ " 
+              << std::setw(25) << time_result.climb_count << " │ "
+              << std::setw(25) << fuel_result.climb_count << "\n";
+    
+    std::cout << " - Разгон+Подъём        │ " 
+              << std::setw(25) << time_result.combined_count << " │ "
+              << std::setw(25) << fuel_result.combined_count << "\n";
+    
+    std::cout << std::string(85, '═') << "\n";
+    
+    // Расчёт процентов
+    double time_diff = fuel_result.total_time - time_result.total_time;
+    double fuel_diff = time_result.total_fuel - fuel_result.total_fuel;
+    double time_percent = (time_diff / fuel_result.total_time) * 100.0;
+    double fuel_percent = (fuel_diff / time_result.total_fuel) * 100.0;
+    
+    std::cout << " Выигрыш/Проигрыш       │ " 
+              << std::setw(25) << "Быстрее на " << std::fixed << std::setprecision(1) 
+              << -time_diff << " с (" << -time_percent << "%)" << " │ "
+              << std::setw(25) << "Экономия " << fuel_diff << " кг (" 
+              << fuel_percent << "%)" << "\n";
+    
+    std::cout << "                        │ " 
+              << std::setw(25) << "Дороже на " << fuel_diff << " кг (" 
+              << fuel_percent << "%)" << " │ "
+              << std::setw(25) << "Медленнее на " << time_diff << " с (" 
+              << time_percent << "%)" << "\n";
+    
+    std::cout << "═══════════════════════════════════════════════════════════════════════════════\n";
+}
+
+int main() {
+    std::cout << std::fixed << std::setprecision(2);
+    
+    std::cout << "\n═══════════════════════════════════════════════════════════════════════════════\n";
+    std::cout << "    ОПТИМИЗАЦИЯ ТРАЕКТОРИИ МС-21 (Вариант 5)\n";
+    std::cout << "═══════════════════════════════════════════════════════════════════════════════\n";
+    std::cout << "Самолёт: MS-21 (масса " << MASS / 1000.0 << " т)\n";
+    std::cout << "Двигатели: 2 x PD-14 (" << THRUST_PERCENT * 100 << "% номинала)\n";
+    std::cout << "Старт: H = " << INIT_ALTITUDE << " м, V = " << INIT_VELOCITY_KMH << " км/ч\n";
+    std::cout << "Финиш: H = " << FINAL_ALTITUDE << " м, V = " << FINAL_VELOCITY_KMH << " км/ч\n";
+    std::cout << "Сетка: " << GRID_SIZE << " шагов\n";
+    std::cout << "═══════════════════════════════════════════════════════════════════════════════\n\n";
+    
+    int choice;
+    std::cout << "ВЫБЕРИТЕ КРИТЕРИЙ ОПТИМИЗАЦИИ:\n";
+    std::cout << "1 - Минимизация времени\n";
+    std::cout << "2 - Минимизация расхода топлива\n";
+    std::cout << "3 - Сравнить оба критерия + GNUPLOT ГРАФИКИ\n";
+    std::cout << "Ваш выбор (1, 2 или 3): ";
+    std::cin >> choice;
+    
+    if (choice == 1) {
+        TrajectoryOptimizer optimizer;
+        TrajectoryResult result = optimizer.optimize(MIN_TIME, "min_time");
+        
+        std::cout << "\n═══════════════════════════════════════════════════════════════════════════════\n";
+        std::cout << "Для генерации графика запустите:\n";
+        std::cout << "gnuplot plot_comparison.gp\n";
+        std::cout << "Результат: MS-21_comparison.png\n";
+        std::cout << "═══════════════════════════════════════════════════════════════════════════════\n";
+        
+    } else if (choice == 2) {
+        TrajectoryOptimizer optimizer;
+        TrajectoryResult result = optimizer.optimize(MIN_FUEL, "min_fuel");
+        
+        std::cout << "\n═══════════════════════════════════════════════════════════════════════════════\n";
+        std::cout << "Для генерации графика запустите:\n";
+        std::cout << "gnuplot plot_comparison.gp\n";
+        std::cout << "Результат: MS-21_comparison.png\n";
+        std::cout << "═══════════════════════════════════════════════════════════════════════════════\n";
+        
+    } else if (choice == 3) {
+        TrajectoryOptimizer optimizer;
+        
+        std::cout << "\n═══════════════════════════════════════════════════════════════════════════════\n";
+        std::cout << "РАСЧЁТ 1: МИНИМИЗАЦИЯ ВРЕМЕНИ\n";
+        std::cout << "═══════════════════════════════════════════════════════════════════════════════\n";
+        TrajectoryResult time_result = optimizer.optimize(MIN_TIME, "min_time");
+        
+        std::cout << "\n═══════════════════════════════════════════════════════════════════════════════\n";
+        std::cout << "РАСЧЁТ 2: МИНИМИЗАЦИЯ ТОПЛИВА\n";
+        std::cout << "═══════════════════════════════════════════════════════════════════════════════\n";
+        TrajectoryResult fuel_result = optimizer.optimize(MIN_FUEL, "min_fuel");
+        
+        printComparisonTable(time_result, fuel_result);
+        
+        createGnuplotScripts(time_result, fuel_result);
+        
+        std::cout << "\n═══════════════════════════════════════════════════════════════════════════════\n";
+        std::cout << "Запуск GNUPLOT скриптов...\n";
+        
+        #ifdef _WIN32
+            system("run_plots.bat");
+        #else
+            system("gnuplot plot_comparison.gp");
+            std::cout << "График создан: MS-21_comparison.png\n";
+        #endif
+        
+        std::cout << "═══════════════════════════════════════════════════════════════════════════════\n";
+    } else {
+        std::cout << "\nНеверный выбор!\n";
+    }
+    
+    std::cout << "\nПрограмма завершена.\n";
+    return 0;
+}
